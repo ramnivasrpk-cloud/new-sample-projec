@@ -1,0 +1,97 @@
+pipeline {
+  agent any
+
+  options {
+    timestamps()
+    ansiColor('xterm')
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '20'))
+    timeout(time: 30, unit: 'MINUTES')
+  }
+
+  environment {
+    AWS_REGION = 'ap-south-1'
+    ECR_REPOSITORY = 'devops-demo-dev'
+    K8S_NAMESPACE = 'devops-demo'
+    APP_NAME = 'nodejs-app'
+    IMAGE_TAG = "${BUILD_NUMBER}"
+  }
+
+  stages {
+    stage('Checkout') {
+      steps { checkout scm }
+    }
+
+    stage('Validate and Test') {
+      steps {
+        sh '''
+          set -eu
+          node --version
+          cd app
+          npm test
+        '''
+      }
+    }
+
+    stage('Build Image') {
+      steps {
+        sh '''
+          set -eu
+          docker build -f docker/Dockerfile.multistage \
+            -t "$ECR_REPOSITORY:$IMAGE_TAG" .
+        '''
+      }
+    }
+
+    stage('Image Scan') {
+      steps {
+        sh '''
+          set -eu
+          trivy image --exit-code 1 --severity HIGH,CRITICAL \
+            "$ECR_REPOSITORY:$IMAGE_TAG"
+        '''
+      }
+    }
+
+    stage('Push to ECR') {
+      steps {
+        withAWS(credentials: 'aws-deploy-role', region: "${AWS_REGION}") {
+          sh '''
+            set -eu
+            ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+            REGISTRY="$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+            aws ecr get-login-password --region "$AWS_REGION" |
+              docker login --username AWS --password-stdin "$REGISTRY"
+            docker tag "$ECR_REPOSITORY:$IMAGE_TAG" "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+            docker push "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+            echo "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" > image-uri.txt
+          '''
+        }
+      }
+    }
+
+    stage('Deploy to EKS') {
+      steps {
+        withAWS(credentials: 'aws-deploy-role', region: "${AWS_REGION}") {
+          sh '''
+            set -eu
+            aws eks update-kubeconfig --name REPLACE_WITH_EKS_CLUSTER --region "$AWS_REGION"
+            ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+            IMAGE="$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$IMAGE_TAG"
+            kubectl -n "$K8S_NAMESPACE" set image deployment/"$APP_NAME" app="$IMAGE"
+            kubectl -n "$K8S_NAMESPACE" rollout status deployment/"$APP_NAME" --timeout=180s
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      sh 'docker image prune -f || true'
+      archiveArtifacts artifacts: 'image-uri.txt', allowEmptyArchive: true
+    }
+    success { echo 'Pipeline completed successfully.' }
+    failure { echo 'Pipeline failed. Review stage logs and investigate the root cause.' }
+  }
+}

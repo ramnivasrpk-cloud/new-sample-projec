@@ -1,0 +1,18 @@
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.multistage
+    image: nodejs-app:local
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: "3000"
+      SERVICE_NAME: "compose-demo"
+      APP_VERSION: "local"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
